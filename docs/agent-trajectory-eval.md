@@ -6,7 +6,7 @@
 
 - 指标层(`metrics.py`)是纯函数:只消费轨迹日志与 golden 样例,不 import `src/`,不触网、不调 LLM,可离线单测。
 - 入口(`run_eval.py`)通过 `build_agent_executor()` 构建真实执行器,与 `src/core/pipeline.py` 使用同一个执行捕获钩子,消费真实产物。
-- 入口只支持**单 agent 运行**(`AGENT_ARCH=single`,默认):`AGENT_ARCH=multi` 时 factory 返回 orchestrator,其轨迹是各 stage 局部步号的拼接、`total_steps` 为 stage 数,与单 runner 指标契约不兼容——入口在构建前明确报错并退出(退出码 1)。
+- 入口支持**单 agent 与多 Agent 运行**(`AGENT_ARCH=single|multi`,默认仍为 single):多 Agent 结果保留原有扁平 `tool_calls_log` 指标,并通过显式 `stage_trajectories` 快照增加阶段状态与局部/累计步数报告。没有阶段快照时,单 agent 命令与 JSON 结构保持不变。
 - 入口用真实工具注册表校验 golden:`expected_tools` 拼错或过期会被判为无效样例(退出码 1),而不是静默按低命中继续评分。
 - 本次冻结**最小指标契约**,股票 guard、Codex `arguments_summary` 等扩展语义明确留给后续 PR(见文末「不在范围」)。
 
@@ -28,7 +28,7 @@ python evals/agent_trajectory/run_eval.py --all --json-out eval_report.json
 | `--golden-path PATH` | 自定义 golden JSON 路径(默认模块旁 `golden_samples.json`) |
 | `--json-out PATH` | 写结构化 JSON 报告(`--all` 时为键控对象) |
 
-退出码:`0` 运行成功(含违规);`1` golden 加载(含 `expected_tools` 不在真实工具注册表)/ 样例选择 / 工具注册表加载失败 / 执行器构建(含 `AGENT_ARCH=multi` 拒绝)/ 运行失败(含执行器返回 `success=false`,如 provider 未配置、LLM 错误、超时、max_steps 耗尽、dashboard 解析失败);`2` 用法错误。
+退出码:`0` 运行成功(含违规);`1` golden 加载(含 `expected_tools` 不在真实工具注册表)/ 样例选择 / 工具注册表加载失败 / 执行器构建 / 运行失败(含执行器返回 `success=false`,如 provider 未配置、LLM 错误、超时、max_steps 耗尽、dashboard 解析失败);`2` 用法错误。
 
 ## 冻结的最小指标契约
 
@@ -43,6 +43,30 @@ python evals/agent_trajectory/run_eval.py --all --json-out eval_report.json
 | `failed_calls` | `success=false` 的条目数 |
 | `cached_calls` | `cached=true` 的条目数(runner 语义:复用不可重试的失败结果) |
 | `distinct_steps` / `max_steps_touched` | 日志 step 与 `AgentResult.total_steps` 取较大者(最后纯回答轮不产生工具调用,日志会低估);`max_steps_touched` 为 `max(step) >= allowed_max_steps` 的启发式 |
+
+## Multi-Agent 阶段轨迹
+
+当执行器结果携带非空 `stage_trajectories` 时,入口在上述工具指标之外输出 `stage_metrics`。每个阶段快照是稳定的 JSON-safe 白名单对象:
+
+| 字段 | 说明 |
+| --- | --- |
+| `stage_name` | 阶段或 specialist 名称 |
+| `status` | `completed` / `failed` / `skipped` 等阶段状态 |
+| `total_steps` | 该阶段自己的局部 agent-loop 步数,不是全局阶段计数 |
+| `tool_calls_log` | 该阶段的原始工具调用日志;空日志也会保留阶段 |
+| `failure_reason` | `stage_failure` / `timeout` / `budget_skip` 等降级原因 |
+
+评估层按快照列表顺序把局部步数累加为 `cumulative_steps`,因此不同阶段从 1 重新计步不会碰撞。报告同时包含期望阶段命中率、缺失/额外阶段、完成/失败/跳过计数,以及每个阶段的局部/累计步数和工具指标。specialist 并发执行后的快照由 scheduler 恢复为选中顺序,不依赖完成先后。
+
+golden 样例可选增加 `expected_stages` 字段:
+
+```json
+{
+  "expected_stages": ["technical", "intel", "decision"]
+}
+```
+
+未配置时仍会报告实际阶段和状态,但阶段命中率显示为未配置;这不会改变现有单 agent 样例的 JSON 字段。
 
 ## Golden 样例 schema
 
@@ -75,8 +99,10 @@ python evals/agent_trajectory/run_eval.py --all --json-out eval_report.json
 
 `--all --json-out` 时外层为 `{sample_id: <上述对象>}` 键控对象。
 
+含阶段快照的多 Agent 报告会在上述对象中追加 `stage_metrics` 字段;原有 `metrics` 字段继续表示扁平工具轨迹指标。
+
 ## 不在范围(后续 PR)
 
 - 股票维度命中判定与 guard 拦截语义(`guarded` / 越界调用违规)
 - Codex App Server 的 `arguments_summary` 方言识别
-- 任何 `.env` / 运行时配置与 CI 门禁(本 PR 零 `src/` 改动,不影响现有分析流程)
+- 任何 `.env` / 运行时配置与 CI 门禁(本 PR 不改变现有分析流程、调度语义或 CI 阻断规则)

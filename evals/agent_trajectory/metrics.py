@@ -69,7 +69,7 @@ semantics are out of scope here and belong in follow-up PRs (see
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -91,6 +91,9 @@ class GoldenSample:
     stock_code: str = ""
     allowed_max_steps: int = 10
     allow_optional_tools: bool = True
+    # Optional expectation for the multi-agent stage-aware reporter.  An
+    # empty list keeps existing single-agent samples and their reports intact.
+    expected_stages: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -107,6 +110,23 @@ class TrajectoryMetrics:
     retries: int
     distinct_steps: int
     max_steps_touched: bool
+    violations: List[str]
+
+
+@dataclass
+class StageTrajectoryMetrics:
+    """Metrics for a whitelisted multi-agent stage trajectory."""
+
+    expected_stage_hit_rate: Optional[float]
+    expected_total: int
+    missing_expected_stages: List[str]
+    unexpected_stages: List[str]
+    observed_stages: List[str]
+    completed_stages: int
+    failed_stages: int
+    skipped_stages: int
+    cumulative_steps: int
+    stage_metrics: List[Dict[str, Any]]
     violations: List[str]
 
 
@@ -325,6 +345,155 @@ def format_text_report(m: TrajectoryMetrics) -> str:
     )
 
 
+def compute_stage_trajectory_metrics(
+    trajectories: List[Dict[str, Any]],
+    golden: GoldenSample,
+) -> StageTrajectoryMetrics:
+    """Normalize stage-local steps and score a multi-agent trajectory.
+
+    The runtime deliberately supplies one snapshot per observed stage.  This
+    function keeps that list order (the specialist scheduler already restores
+    selected-agent order after concurrent execution), and only derives
+    cumulative steps from each stage's local ``total_steps``.  Missing
+    expected stages therefore remain missing instead of being inferred from
+    tool-log gaps.
+    """
+    violations: List[str] = []
+    if not isinstance(trajectories, list):
+        violations.append("stage_trajectories must be a list")
+        trajectories = []
+
+    expected_raw = getattr(golden, "expected_stages", [])
+    if isinstance(expected_raw, list):
+        expected = [name for name in expected_raw if isinstance(name, str) and name.strip()]
+        if len(expected) != len(expected_raw):
+            violations.append("expected_stages must contain only non-empty strings")
+        if len(set(expected)) != len(expected):
+            violations.append("expected_stages must not contain duplicate names")
+        expected = list(dict.fromkeys(expected))
+    else:
+        expected = []
+        violations.append("expected_stages must be a list of stage names")
+
+    observed: List[str] = []
+    observed_set = set()
+    completed = failed = skipped = 0
+    cumulative_steps = 0
+    stage_metrics: List[Dict[str, Any]] = []
+    valid_statuses = {"pending", "running", "completed", "failed", "skipped"}
+
+    for index, snapshot in enumerate(trajectories):
+        if not isinstance(snapshot, dict):
+            violations.append(f"stage snapshot #{index} must be an object")
+            continue
+
+        stage_name = snapshot.get("stage_name", "")
+        if not isinstance(stage_name, str) or not stage_name.strip():
+            violations.append(f"stage snapshot #{index} stage_name must be a non-empty string")
+            stage_name = str(stage_name or "")
+        else:
+            stage_name = stage_name.strip()
+            if stage_name in observed_set:
+                violations.append(f"duplicate stage snapshot: {stage_name}")
+            else:
+                observed.append(stage_name)
+                observed_set.add(stage_name)
+
+        status = snapshot.get("status", "")
+        status = getattr(status, "value", status)
+        if not isinstance(status, str) or status not in valid_statuses:
+            violations.append(f"stage snapshot #{index} has invalid status")
+            status = str(status or "")
+
+        raw_steps = snapshot.get("total_steps", 0)
+        if isinstance(raw_steps, bool) or not isinstance(raw_steps, int) or raw_steps < 0:
+            violations.append(f"stage snapshot #{index} total_steps must be a non-negative integer")
+            raw_steps = 0
+        local_steps = max(raw_steps, 0)
+
+        raw_log = snapshot.get("tool_calls_log", [])
+        if not isinstance(raw_log, list):
+            violations.append(f"stage snapshot #{index} tool_calls_log must be a list")
+            raw_log = []
+        log_steps = max(
+            (_coerce_step(entry.get("step")) for entry in raw_log if isinstance(entry, dict)),
+            default=0,
+        )
+        local_steps = max(local_steps, log_steps)
+
+        failure_reason = snapshot.get("failure_reason")
+        failure_reason = getattr(failure_reason, "value", failure_reason)
+        if status == "completed":
+            completed += 1
+        elif status == "failed":
+            failed += 1
+        elif status == "skipped":
+            skipped += 1
+
+        cumulative_start = cumulative_steps + 1 if local_steps else None
+        cumulative_steps += local_steps
+        stage_metrics.append(
+            {
+                "stage_name": stage_name,
+                "status": status,
+                "failure_reason": failure_reason,
+                "local_steps": local_steps,
+                "cumulative_start_step": cumulative_start,
+                "cumulative_end_step": cumulative_steps,
+                "tool_metrics": asdict(
+                    compute_trajectory_metrics(raw_log, golden, total_steps=local_steps)
+                ),
+            }
+        )
+
+    missing = [name for name in expected if name not in observed_set]
+    unexpected = [name for name in observed if expected and name not in expected]
+    expected_stage_hit_rate = (
+        (len(expected) - len(missing)) / len(expected) if expected else None
+    )
+    if expected and missing:
+        violations.append(f"missing expected stages: {', '.join(missing)}")
+    if unexpected:
+        violations.append(f"unexpected stages: {', '.join(unexpected)}")
+
+    return StageTrajectoryMetrics(
+        expected_stage_hit_rate=expected_stage_hit_rate,
+        expected_total=len(expected),
+        missing_expected_stages=missing,
+        unexpected_stages=unexpected,
+        observed_stages=observed,
+        completed_stages=completed,
+        failed_stages=failed,
+        skipped_stages=skipped,
+        cumulative_steps=cumulative_steps,
+        stage_metrics=stage_metrics,
+        violations=violations,
+    )
+
+
+def format_stage_text_report(m: StageTrajectoryMetrics) -> str:
+    """Render the stage portion of a multi-agent trajectory report."""
+    if m.expected_total:
+        hit = f"{m.expected_stage_hit_rate * 100:.1f}%"
+        expected = f"{m.expected_total - len(m.missing_expected_stages)}/{m.expected_total} ({hit})"
+    else:
+        expected = "未配置期望阶段"
+    missing = ", ".join(m.missing_expected_stages) if m.missing_expected_stages else "无"
+    violations = "; ".join(m.violations) if m.violations else "无"
+    lines = [
+        "--------------------------------------------",
+        "Multi-Agent 阶段轨迹",
+        "--------------------------------------------",
+        f"- 期望阶段命中: {expected}",
+        f"- 观测阶段: {', '.join(m.observed_stages) if m.observed_stages else '无'}",
+        f"- 缺失期望阶段: {missing}",
+        f"- 阶段状态: 已完成 {m.completed_stages} | 失败 {m.failed_stages} | 跳过 {m.skipped_stages}",
+        f"- 累计步数: {m.cumulative_steps}",
+        f"- 阶段违规项: {violations}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def load_golden_samples(
     path: Optional[str] = None,
     known_tool_names: Optional[Iterable[str]] = None,
@@ -418,4 +587,10 @@ def validate_golden_sample(
         issues.append("allowed_max_steps must be >= 1")
     if not isinstance(sample.allow_optional_tools, bool):
         issues.append("allow_optional_tools must be a boolean")
+    if not isinstance(sample.expected_stages, list):
+        issues.append("expected_stages must be a list of stage names")
+    elif any(not isinstance(name, str) or not name.strip() for name in sample.expected_stages):
+        issues.append("expected_stages must contain only non-empty strings")
+    elif len(set(sample.expected_stages)) != len(sample.expected_stages):
+        issues.append("expected_stages must not contain duplicate names")
     return issues

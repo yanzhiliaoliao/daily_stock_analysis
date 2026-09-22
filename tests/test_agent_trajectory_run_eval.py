@@ -22,7 +22,7 @@ from evals.agent_trajectory.metrics import GoldenSample, load_golden_samples
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "agent_trajectory"
 
 
-def _stub_executor(log, total_steps=None):
+def _stub_executor(log, total_steps=None, stage_trajectories=None):
     """Duck-typed executor recording its run calls (no src/ import)."""
 
     class _Stub:
@@ -31,7 +31,11 @@ def _stub_executor(log, total_steps=None):
 
         def run(self, task, context=None):
             self.calls.append((task, context))
-            return SimpleNamespace(tool_calls_log=list(log), total_steps=total_steps)
+            return SimpleNamespace(
+                tool_calls_log=list(log),
+                total_steps=total_steps,
+                stage_trajectories=list(stage_trajectories or []),
+            )
 
     return _Stub()
 
@@ -204,12 +208,11 @@ class TestRunFailure:
 # 4. runtime-seam guards: multi-arch rejection + golden registry validation
 # ---------------------------------------------------------------------------
 class TestArchGuard:
-    def test_multi_arch_raises(self, monkeypatch):
+    def test_multi_arch_is_allowed(self, monkeypatch):
         import src.config
 
         monkeypatch.setattr(src.config, "get_config", lambda: SimpleNamespace(agent_arch="multi"))
-        with pytest.raises(RuntimeError, match="multi"):
-            run_eval._check_agent_arch()
+        assert run_eval._check_agent_arch() == "multi"
 
     def test_single_arch_passes(self, monkeypatch):
         import src.config
@@ -293,13 +296,44 @@ class TestMainCli:
         assert run_eval.main(["--sample", "600519_technical"]) == 1
         assert "failed to build agent executor" in capsys.readouterr().err
 
-    def test_multi_arch_build_rejection_exit_one(self, monkeypatch, capsys):
-        def _boom():
-            raise RuntimeError("AGENT_ARCH=multi is not supported by this minimal eval")
+    def test_multi_arch_result_emits_stage_report(self, tmp_path, capsys):
+        log, total_steps = _fixture("positive_600519_technical")
+        result = SimpleNamespace(
+            success=True,
+            tool_calls_log=list(log),
+            total_steps=total_steps,
+            stage_trajectories=[
+                {
+                    "stage_name": "technical",
+                    "status": "completed",
+                    "total_steps": 2,
+                    "tool_calls_log": list(log),
+                },
+                {
+                    "stage_name": "decision",
+                    "status": "skipped",
+                    "total_steps": 0,
+                    "tool_calls_log": [],
+                    "failure_reason": "budget_skip",
+                },
+            ],
+        )
+        out = tmp_path / "multi.json"
+        run_eval.run_sample(
+            _result_executor(result),
+            GoldenSample(
+                id="multi",
+                task_description="multi task",
+                expected_tools=["get_realtime_quote", "get_daily_history", "analyze_trend"],
+                expected_stages=["technical", "decision"],
+            ),
+            json_out=out,
+        )
 
-        monkeypatch.setattr(run_eval, "_build_executor", _boom)
-        assert run_eval.main(["--sample", "600519_technical"]) == 1
-        assert "multi" in capsys.readouterr().err
+        report = json.loads(out.read_text(encoding="utf-8"))
+        assert report["stage_metrics"]["expected_stage_hit_rate"] == 1.0
+        assert report["stage_metrics"]["skipped_stages"] == 1
+        assert "Multi-Agent 阶段轨迹" in capsys.readouterr().out
 
     def test_run_failure_exit_one(self, monkeypatch, capsys):
         class _Exploding:
