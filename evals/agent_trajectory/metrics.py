@@ -130,6 +130,20 @@ class StageTrajectoryMetrics:
     violations: List[str]
 
 
+@dataclass
+class _ToolLogMetrics:
+    """Counts derived only from one tool log, without golden expectations."""
+
+    tool_calls: int
+    used_tools: List[str]
+    redundant_calls: int
+    cached_calls: int
+    failed_calls: int
+    retries: int
+    distinct_steps: int
+    max_step: int
+
+
 def _args_key(arguments: Any) -> str:
     """Return a stable idempotency key for tool-call arguments (see module docstring).
 
@@ -160,6 +174,65 @@ def _coerce_step(value: Any) -> int:
     return step if step > 0 else 0
 
 
+def _compute_tool_log_metrics(
+    log: List[Dict[str, Any]],
+    total_steps: Optional[int] = None,
+) -> _ToolLogMetrics:
+    """Count call-local facts without applying sample-level expectations."""
+    used_tools: List[str] = []
+    key_counts: Dict[tuple, int] = {}
+    key_failed_seen: Dict[tuple, bool] = {}
+    key_retries: Dict[tuple, int] = {}
+    failed_calls = cached_calls = redundant_calls = tool_calls = 0
+    distinct_steps = max_step = 0
+    seen_steps: set = set()
+
+    for entry in log:
+        if not isinstance(entry, dict):
+            continue
+        tool_calls += 1
+        tool = entry.get("tool") or ""
+        if tool and tool not in used_tools:
+            used_tools.append(tool)
+        success = bool(entry.get("success", True))
+        step = _coerce_step(entry.get("step"))
+        if step and step not in seen_steps:
+            seen_steps.add(step)
+            distinct_steps += 1
+            max_step = max(max_step, step)
+        if not success:
+            failed_calls += 1
+        if entry.get("cached"):
+            cached_calls += 1
+
+        key = (tool, _args_key(_entry_arguments(entry)))
+        if key_counts.get(key, 0):
+            redundant_calls += 1
+        key_counts[key] = key_counts.get(key, 0) + 1
+        if key_failed_seen.get(key):
+            key_retries[key] = key_retries.get(key, 0) + 1
+        key_failed_seen[key] = not success
+
+    total = 0
+    if total_steps is not None:
+        try:
+            total = int(total_steps)
+        except (TypeError, ValueError):
+            total = 0
+        total = total if total > 0 else 0
+
+    return _ToolLogMetrics(
+        tool_calls=tool_calls,
+        used_tools=used_tools,
+        redundant_calls=redundant_calls,
+        cached_calls=cached_calls,
+        failed_calls=failed_calls,
+        retries=sum(key_retries.values()),
+        distinct_steps=max(distinct_steps, total),
+        max_step=max(max_step, total),
+    )
+
+
 def compute_trajectory_metrics(
     log: List[Dict[str, Any]],
     golden: GoldenSample,
@@ -185,10 +258,8 @@ def compute_trajectory_metrics(
     non-positive ``allowed_max_steps`` is reported with the validator's
     wording (and the budget assertion stays disabled).
     """
-    used_tools: List[str] = []
-    key_counts: Dict[tuple, int] = {}
-    key_failed_seen: Dict[tuple, bool] = {}
-    key_retries: Dict[tuple, int] = {}
+    log_metrics = _compute_tool_log_metrics(log, total_steps=total_steps)
+    used_tools = log_metrics.used_tools
     # Extract the expected tool list before scanning entries.  Malformed
     # elements are not silently dropped: they are reported as a violation
     # below (mirroring validate_golden_sample, which rejects them at load
@@ -210,43 +281,12 @@ def compute_trajectory_metrics(
     expected_dupes = len(set(expected)) != len(expected)
     if expected_dupes:
         expected = list(dict.fromkeys(expected))
-    failed_calls = 0
-    cached_calls = 0
-    redundant_calls = 0
-    distinct_steps = 0
-    max_step = 0
-    seen_steps: set = set()
-
-    for entry in log:
-        if not isinstance(entry, dict):
-            continue
-        tool = entry.get("tool") or ""
-        success = bool(entry.get("success", True))
-        if tool and tool not in used_tools:
-            used_tools.append(tool)
-        step = _coerce_step(entry.get("step"))
-        if step and step not in seen_steps:
-            seen_steps.add(step)
-            distinct_steps += 1
-            max_step = max(max_step, step)
-        if not success:
-            failed_calls += 1
-        if entry.get("cached"):
-            cached_calls += 1
-
-        key = (tool, _args_key(_entry_arguments(entry)))
-        if key_counts.get(key, 0):
-            redundant_calls += 1
-        key_counts[key] = key_counts.get(key, 0) + 1
-        # An occurrence is a retry only when the same call already failed
-        # before it (see module docstring for the precise contract).
-        if key_failed_seen.get(key):
-            key_retries[key] = key_retries.get(key, 0) + 1
-        # A success clears the failure state: repeats after a recovery count
-        # as redundant only, not as further retries.
-        key_failed_seen[key] = not success
-
-    retries = sum(key_retries.values())
+    failed_calls = log_metrics.failed_calls
+    cached_calls = log_metrics.cached_calls
+    redundant_calls = log_metrics.redundant_calls
+    retries = log_metrics.retries
+    distinct_steps = log_metrics.distinct_steps
+    max_step = log_metrics.max_step
     violations: List[str] = []
 
     if expected_dupes:
@@ -271,18 +311,6 @@ def compute_trajectory_metrics(
         optional_allowed = False
     if optional_tools_used and not optional_allowed:
         violations.append(f"optional tools used but not allowed: {', '.join(optional_tools_used)}")
-
-    # The final answer round consumes a step but produces no tool call, so
-    # when the caller supplies the run's real total it may exceed the log.
-    total = 0
-    if total_steps is not None:
-        try:
-            total = int(total_steps)
-        except (TypeError, ValueError):
-            total = 0
-        total = total if total > 0 else 0
-    distinct_steps = max(distinct_steps, total)
-    max_step = max(max_step, total)
 
     limit = golden.allowed_max_steps
     if isinstance(limit, bool) or not isinstance(limit, int):
@@ -432,6 +460,7 @@ def compute_stage_trajectory_metrics(
 
         cumulative_start = cumulative_steps + 1 if local_steps else None
         cumulative_steps += local_steps
+        tool_metrics = _compute_tool_log_metrics(raw_log, total_steps=local_steps)
         stage_metrics.append(
             {
                 "stage_name": stage_name,
@@ -440,9 +469,14 @@ def compute_stage_trajectory_metrics(
                 "local_steps": local_steps,
                 "cumulative_start_step": cumulative_start,
                 "cumulative_end_step": cumulative_steps,
-                "tool_metrics": asdict(
-                    compute_trajectory_metrics(raw_log, golden, total_steps=local_steps)
-                ),
+                "tool_metrics": {
+                    "tool_calls": tool_metrics.tool_calls,
+                    "tools_used": tool_metrics.used_tools,
+                    "redundant_calls": tool_metrics.redundant_calls,
+                    "cached_calls": tool_metrics.cached_calls,
+                    "failed_calls": tool_metrics.failed_calls,
+                    "retries": tool_metrics.retries,
+                },
             }
         )
 
@@ -501,7 +535,8 @@ def format_stage_text_report(m: StageTrajectoryMetrics) -> str:
             f"- 阶段 {stage.get('stage_name') or '(未命名)'}: "
             f"状态={stage.get('status') or 'unknown'} | "
             f"局部步数={stage.get('local_steps', 0)} | 累计步数={cumulative} | "
-            f"失败原因={reason} | 工具失败={tool_metrics.get('failed_calls', 0)} | "
+            f"失败原因={reason} | 工具调用={tool_metrics.get('tool_calls', 0)} | "
+            f"工具失败={tool_metrics.get('failed_calls', 0)} | "
             f"重试={tool_metrics.get('retries', 0)}"
         )
     return "\n".join(lines) + "\n"

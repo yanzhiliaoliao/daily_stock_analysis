@@ -423,6 +423,90 @@ class TestMainCli:
         assert report["stage_metrics"]["skipped_stages"] == 1
         assert "Multi-Agent 阶段轨迹" in capsys.readouterr().out
 
+    def test_multi_agent_tool_metrics_are_local_while_golden_scoring_is_global(self, tmp_path, capsys):
+        quote_failed = {
+            "step": 1,
+            "tool": "quote",
+            "arguments": {"symbol": "600519"},
+            "success": False,
+            "cached": False,
+        }
+        quote_retry = {
+            "step": 2,
+            "tool": "quote",
+            "arguments": {"symbol": "600519"},
+            "success": True,
+            "cached": False,
+        }
+        news_call = {
+            "step": 1,
+            "tool": "news",
+            "arguments": {"symbol": "600519"},
+            "success": True,
+            "cached": True,
+        }
+        result = SimpleNamespace(
+            success=True,
+            tool_calls_log=[quote_failed, quote_retry, news_call],
+            total_steps=6,
+            stage_trajectories=[
+                {
+                    "stage_name": "technical",
+                    "status": "completed",
+                    "total_steps": 3,
+                    "tool_calls_log": [quote_failed, quote_retry],
+                },
+                {
+                    "stage_name": "intel",
+                    "status": "completed",
+                    "total_steps": 3,
+                    "tool_calls_log": [news_call],
+                },
+            ],
+        )
+        sample = GoldenSample(
+            id="multi_stage_tool_expectations",
+            task_description="Use quote in technical and news in intel",
+            expected_tools=["quote", "news"],
+            allowed_max_steps=3,
+            allow_optional_tools=False,
+            expected_stages=["technical", "intel"],
+        )
+        out = tmp_path / "multi-stage-tools.json"
+
+        run_eval.run_sample(_result_executor(result), sample, json_out=out)
+
+        report = json.loads(out.read_text(encoding="utf-8"))
+        assert report["metrics"]["expected_hit_rate"] == 1.0
+        assert report["metrics"]["missing_expected"] == []
+        assert report["metrics"]["optional_tools_used"] == []
+        assert report["metrics"]["max_steps_touched"] is True
+        assert report["violations"] == ["trajectory reached allowed_max_steps (3)"]
+
+        stages = report["stage_metrics"]["stage_metrics"]
+        technical_tools = stages[0]["tool_metrics"]
+        intel_tools = stages[1]["tool_metrics"]
+        assert technical_tools == {
+            "tool_calls": 2,
+            "tools_used": ["quote"],
+            "redundant_calls": 1,
+            "cached_calls": 0,
+            "failed_calls": 1,
+            "retries": 1,
+        }
+        assert intel_tools == {
+            "tool_calls": 1,
+            "tools_used": ["news"],
+            "redundant_calls": 0,
+            "cached_calls": 1,
+            "failed_calls": 0,
+            "retries": 0,
+        }
+        assert report["stage_metrics"]["violations"] == []
+        output = capsys.readouterr().out
+        assert "工具调用=2 | 工具失败=1 | 重试=1" in output
+        assert "工具调用=1 | 工具失败=0 | 重试=0" in output
+
     def test_failed_multi_agent_cli_writes_json_and_returns_one(self, tmp_path, monkeypatch, capsys):
         golden_path = tmp_path / "golden.json"
         golden_path.write_text(
