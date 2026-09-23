@@ -68,6 +68,7 @@ def _build_multi_report(
 ) -> Dict[str, Any]:
     """Extend the historical report only when stage snapshots are present."""
     report = _build_report(sample, metrics)
+    report["run_status"] = "completed"
     report["stage_metrics"] = asdict(stage_metrics)
     report["violations"] = list(dict.fromkeys(metrics.violations + stage_metrics.violations))
     return report
@@ -125,18 +126,26 @@ def _evaluate_sample(executor, sample: GoldenSample):
     if sample.stock_code:
         context = {"stock_code": sample.stock_code}
     result = executor.run(sample.task_description, context=context)
-    if getattr(result, "success", None) is False:
-        error = getattr(result, "error", None)
+    run_failed = getattr(result, "success", None) is False
+    error = getattr(result, "error", None)
+    trajectories = getattr(result, "stage_trajectories", None) or []
+    # Preserve historical behavior for single-agent/legacy results. A failed
+    # Multi-Agent result has an explicit stage trace that must be scored and
+    # written before the CLI returns its non-zero exit status.
+    if run_failed and not trajectories:
         raise RuntimeError(f"agent run failed (success=false): {error or 'no error detail'}")
 
     log = getattr(result, "tool_calls_log", None) or []
     total_steps = getattr(result, "total_steps", None)
     metrics = compute_trajectory_metrics(log, sample, total_steps=total_steps)
-    trajectories = getattr(result, "stage_trajectories", None) or []
     if trajectories:
         stage_metrics = compute_stage_trajectory_metrics(trajectories, sample)
-        return metrics, stage_metrics, _build_multi_report(sample, metrics, stage_metrics)
-    return metrics, None, _build_report(sample, metrics)
+        report = _build_multi_report(sample, metrics, stage_metrics)
+        if run_failed:
+            report["run_status"] = "failed"
+        run_error = (error or "agent run failed (success=false)") if run_failed else None
+        return metrics, stage_metrics, report, run_error
+    return metrics, None, _build_report(sample, metrics), None
 
 
 def run_sample(executor, sample: GoldenSample, *, json_out: Optional[Path] = None) -> TrajectoryMetrics:
@@ -146,18 +155,19 @@ def run_sample(executor, sample: GoldenSample, *, json_out: Optional[Path] = Non
     ``result`` carries ``tool_calls_log`` (and optionally ``total_steps``) —
     the same shape as ``src.agent.executor.AgentResult``.  The production
     executor is built lazily by :func:`_build_executor`; tests may pass a
-    stub.  A result carrying an explicit ``success=False`` is a run failure
-    (the executor reported a provider / timeout / budget error) and raises
-    ``RuntimeError`` before any scoring; duck-typed results without a
-    ``success`` attribute are treated as successful.  The text summary is
-    always printed to stdout; ``json_out`` additionally writes the
-    structured report for this sample.
+    stub. A result carrying ``success=False`` and no stage snapshots raises as
+    before. When a failed Multi-Agent result includes stage snapshots, this
+    function prints and writes the diagnostic report first, then raises
+    ``RuntimeError`` so the CLI still exits with code 1. Duck-typed results
+    without a ``success`` attribute are treated as successful.
     """
-    metrics, stage_metrics, report = _evaluate_sample(executor, sample)
+    metrics, stage_metrics, report, run_error = _evaluate_sample(executor, sample)
     print(format_text_report(metrics))
     if stage_metrics is not None:
         print(format_stage_text_report(stage_metrics))
     _write_json(json_out, report)
+    if run_error:
+        raise RuntimeError(f"agent run failed (success=false): {run_error}")
     return metrics
 
 
@@ -208,10 +218,11 @@ def main(argv=None) -> int:
         return 1
 
     reports: Dict[str, Dict[str, Any]] = {}
+    failed_multi_run = False
     for sample in samples:
         print(f"[eval] sample: {sample.id} | task: {sample.task_description}")
         try:
-            metrics, stage_metrics, report = _evaluate_sample(executor, sample)
+            metrics, stage_metrics, report, run_error = _evaluate_sample(executor, sample)
             print(format_text_report(metrics))
             if stage_metrics is not None:
                 print(format_stage_text_report(stage_metrics))
@@ -219,10 +230,17 @@ def main(argv=None) -> int:
             print(f"error: sample '{sample.id}' failed: {exc}", file=sys.stderr)
             return 1
         reports[sample.id] = report
+        if run_error:
+            failed_multi_run = True
+            print(
+                f"error: sample '{sample.id}' failed: "
+                f"agent run failed (success=false): {run_error}",
+                file=sys.stderr,
+            )
 
     if args.json_out:
         _write_json(Path(args.json_out), reports if args.all else reports[args.sample])
-    return 0
+    return 1 if failed_multi_run else 0
 
 
 if __name__ == "__main__":

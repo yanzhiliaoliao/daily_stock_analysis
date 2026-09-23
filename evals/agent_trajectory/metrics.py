@@ -491,6 +491,19 @@ def format_stage_text_report(m: StageTrajectoryMetrics) -> str:
         f"- 累计步数: {m.cumulative_steps}",
         f"- 阶段违规项: {violations}",
     ]
+    for stage in m.stage_metrics:
+        start = stage.get("cumulative_start_step")
+        end = stage.get("cumulative_end_step", 0)
+        cumulative = f"{start}-{end}" if start is not None else "无"
+        reason = stage.get("failure_reason") or "无"
+        tool_metrics = stage.get("tool_metrics") or {}
+        lines.append(
+            f"- 阶段 {stage.get('stage_name') or '(未命名)'}: "
+            f"状态={stage.get('status') or 'unknown'} | "
+            f"局部步数={stage.get('local_steps', 0)} | 累计步数={cumulative} | "
+            f"失败原因={reason} | 工具失败={tool_metrics.get('failed_calls', 0)} | "
+            f"重试={tool_metrics.get('retries', 0)}"
+        )
     return "\n".join(lines) + "\n"
 
 

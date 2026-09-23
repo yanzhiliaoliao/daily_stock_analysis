@@ -28,7 +28,7 @@ python evals/agent_trajectory/run_eval.py --all --json-out eval_report.json
 | `--golden-path PATH` | 自定义 golden JSON 路径(默认模块旁 `golden_samples.json`) |
 | `--json-out PATH` | 写结构化 JSON 报告(`--all` 时为键控对象) |
 
-退出码:`0` 运行成功(含违规);`1` golden 加载(含 `expected_tools` 不在真实工具注册表)/ 样例选择 / 工具注册表加载失败 / 执行器构建 / 运行失败(含执行器返回 `success=false`,如 provider 未配置、LLM 错误、超时、max_steps 耗尽、dashboard 解析失败);`2` 用法错误。
+退出码:`0` 运行成功(含违规);`1` golden 加载(含 `expected_tools` 不在真实工具注册表)/ 样例选择 / 工具注册表加载失败 / 执行器构建 / 运行失败(含执行器返回 `success=false`,如 provider 未配置、LLM 错误、超时、max_steps 耗尽、dashboard 解析失败);`2` 用法错误。Multi-Agent 结果若在失败时带有阶段快照,入口会先输出并写入可检查的失败轨迹报告,再以退出码 `1` 表示运行失败;单 Agent 失败行为不变。
 
 ## 冻结的最小指标契约
 
@@ -56,7 +56,7 @@ python evals/agent_trajectory/run_eval.py --all --json-out eval_report.json
 | `tool_calls_log` | 该阶段的原始工具调用日志;空日志也会保留阶段 |
 | `failure_reason` | `stage_failure` / `timeout` / `budget_skip` 等降级原因 |
 
-评估层按快照列表顺序把局部步数累加为 `cumulative_steps`,因此不同阶段从 1 重新计步不会碰撞。报告同时包含期望阶段命中率、缺失/额外阶段、完成/失败/跳过计数,以及每个阶段的局部/累计步数和工具指标。specialist 并发执行后的快照由 scheduler 恢复为选中顺序,不依赖完成先后。
+评估层按快照列表顺序把局部步数累加为 `cumulative_steps`,因此不同阶段从 1 重新计步不会碰撞。报告同时包含期望阶段命中率、缺失/额外阶段、完成/失败/跳过计数,以及每个阶段的状态、失败原因、局部/累计步数和工具失败/重试指标。关键阶段失败后,仍使用已返回的快照生成阶段报告;配置了 `expected_stages` 时,尚未执行的后续阶段会列入缺失阶段。specialist 并发执行后的快照由 scheduler 恢复为选中顺序,不依赖完成先后。
 
 golden 样例可选增加 `expected_stages` 字段:
 
@@ -80,6 +80,7 @@ golden 样例可选增加 `expected_stages` 字段:
 | `expected_tools` | string[] | 期望工具名(必填,非空、无重复) |
 | `allowed_max_steps` | int | 步数预算启发式(默认 10,>= 1) |
 | `allow_optional_tools` | bool | 是否容忍期望外工具(默认 true) |
+| `expected_stages` | string[] | 多 Agent 阶段期望列表(可选、非空名称且不重复);用于统计命中与缺失阶段 |
 
 校验:加载路径(`load_golden_samples`)直接拒绝非法样例;直接构造路径(`compute_trajectory_metrics`)以 validator 完全相同的措辞逐条上报违规,两条路径的契约按构造保持一致。`known_tool_names` 可注入真实工具注册表做成员校验(metrics 层自身不 import `src/`);`run_eval.py` 入口会自动注入真实工具注册表。
 
@@ -99,7 +100,7 @@ golden 样例可选增加 `expected_stages` 字段:
 
 `--all --json-out` 时外层为 `{sample_id: <上述对象>}` 键控对象。
 
-含阶段快照的多 Agent 报告会在上述对象中追加 `stage_metrics` 字段;原有 `metrics` 字段继续表示扁平工具轨迹指标。
+含阶段快照的多 Agent 报告会在上述对象中追加 `run_status` (`completed` / `failed`) 与 `stage_metrics` 字段;原有 `metrics` 字段继续表示扁平工具轨迹指标。运行失败但携带阶段快照时,JSON 报告仍会写出,进程退出码为 1。
 
 ## 不在范围(后续 PR)
 

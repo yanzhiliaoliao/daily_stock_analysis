@@ -5,14 +5,16 @@ All tests are offline: ``run_eval._build_executor`` is monkeypatched with a
 duck-typed stub, and the three checked-in fixtures provide real-shaped
 ``tool_calls_log`` payloads covering the positive path, the negative path
 (missing expected tool + cached failure + max_steps) and the retry path.
-The two runtime-seam guards (multi-arch rejection and golden validation
+The two runtime-seam guards (multi-arch acceptance and golden validation
 against the real tool registry) are exercised via monkeypatched config /
 registry access plus one lazy real-registry check.
 """
 
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -172,8 +174,8 @@ class TestRunSampleRetry:
 # 3.5 run failure: results carrying an explicit success=False
 # ---------------------------------------------------------------------------
 class TestRunFailure:
-    def test_unsuccessful_result_raises_before_scoring(self, capsys):
-        # Owner repro: a real AgentResult with success=False must not be scored.
+    def test_unsuccessful_single_agent_result_raises_without_report(self, capsys):
+        # Single-agent failure behavior stays unchanged when no stage trace exists.
         executor = _result_executor(SimpleNamespace(success=False, error="boom", tool_calls_log=[], total_steps=0))
         with pytest.raises(RuntimeError, match="boom"):
             run_eval.run_sample(executor, _goldens()["600519_technical"])
@@ -202,6 +204,92 @@ class TestRunFailure:
         result = SimpleNamespace(success=None, tool_calls_log=list(log), total_steps=total_steps)
         m = run_eval.run_sample(_result_executor(result), _goldens()["600519_technical"])
         assert m.expected_hit_rate == 1.0
+
+    def test_failed_multi_agent_result_writes_stage_report_before_raising(self, tmp_path, capsys):
+        stage_log = [{"step": 1, "tool": "get_realtime_quote", "success": False}]
+        result = SimpleNamespace(
+            success=False,
+            error="Stage 'technical' failed: provider timeout",
+            tool_calls_log=stage_log,
+            total_steps=1,
+            stage_trajectories=[
+                {
+                    "stage_name": "technical",
+                    "status": "failed",
+                    "failure_reason": "timeout",
+                    "total_steps": 3,
+                    "tool_calls_log": stage_log,
+                }
+            ],
+        )
+        sample = GoldenSample(
+            id="failed_multi",
+            task_description="multi-agent failure",
+            expected_tools=["get_realtime_quote"],
+            expected_stages=["technical", "decision"],
+        )
+        out = tmp_path / "failed-multi.json"
+
+        with pytest.raises(RuntimeError, match="provider timeout"):
+            run_eval.run_sample(_result_executor(result), sample, json_out=out)
+
+        report = json.loads(out.read_text(encoding="utf-8"))
+        stage_metrics = report["stage_metrics"]
+        assert report["run_status"] == "failed"
+        assert stage_metrics["failed_stages"] == 1
+        assert stage_metrics["missing_expected_stages"] == ["decision"]
+        assert stage_metrics["cumulative_steps"] == 3
+        assert stage_metrics["stage_metrics"][0]["failure_reason"] == "timeout"
+        output = capsys.readouterr().out
+        assert "阶段 technical: 状态=failed" in output
+        assert "局部步数=3" in output
+        assert "缺失期望阶段: decision" in output
+        assert "失败原因=timeout" in output
+
+    def test_orchestrator_critical_failure_reaches_stage_report(self, tmp_path, capsys):
+        try:
+            import litellm  # noqa: F401
+        except ModuleNotFoundError:
+            sys.modules["litellm"] = MagicMock()
+
+        from src.agent.orchestrator import AgentOrchestrator
+        from src.agent.protocols import StageFailureReason, StageResult, StageStatus
+
+        tool_log = [{"step": 1, "tool": "get_realtime_quote", "success": False}]
+        technical = MagicMock(agent_name="technical")
+        technical.run.return_value = StageResult(
+            stage_name="technical",
+            status=StageStatus.FAILED,
+            failure_reason=StageFailureReason.TIMEOUT,
+            total_steps=3,
+            meta={"tool_calls_log": tool_log},
+        )
+        orchestrator = AgentOrchestrator(tool_registry=MagicMock(), llm_adapter=MagicMock())
+        sample = GoldenSample(
+            id="orchestrator_failure",
+            task_description="critical stage failure",
+            expected_tools=["get_realtime_quote"],
+            expected_stages=["technical", "decision"],
+        )
+        report_path = tmp_path / "orchestrator-failure.json"
+
+        with patch.object(orchestrator, "_build_agent_chain", return_value=[technical]):
+            result = orchestrator.run(sample.task_description)
+
+        assert result.success is False
+        assert result.stage_trajectories[0]["status"] == "failed"
+        assert result.stage_trajectories[0]["failure_reason"] == "timeout"
+        with pytest.raises(RuntimeError, match="Stage 'technical' failed"):
+            run_eval.run_sample(_result_executor(result), sample, json_out=report_path)
+
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        assert report["run_status"] == "failed"
+        assert report["stage_metrics"]["failed_stages"] == 1
+        assert report["stage_metrics"]["missing_expected_stages"] == ["decision"]
+        assert report["stage_metrics"]["cumulative_steps"] == 3
+        output = capsys.readouterr().out
+        assert "阶段 technical: 状态=failed" in output
+        assert "失败原因=timeout" in output
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +422,51 @@ class TestMainCli:
         assert report["stage_metrics"]["expected_stage_hit_rate"] == 1.0
         assert report["stage_metrics"]["skipped_stages"] == 1
         assert "Multi-Agent 阶段轨迹" in capsys.readouterr().out
+
+    def test_failed_multi_agent_cli_writes_json_and_returns_one(self, tmp_path, monkeypatch, capsys):
+        golden_path = tmp_path / "golden.json"
+        golden_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "failed_multi",
+                        "task_description": "multi-agent failure",
+                        "stock_code": "",
+                        "expected_tools": ["get_realtime_quote"],
+                        "expected_stages": ["technical", "decision"],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        stage_log = [{"step": 1, "tool": "get_realtime_quote", "success": False}]
+        failed_result = SimpleNamespace(
+            success=False,
+            error="technical provider timeout",
+            tool_calls_log=stage_log,
+            total_steps=1,
+            stage_trajectories=[
+                {
+                    "stage_name": "technical",
+                    "status": "failed",
+                    "failure_reason": "timeout",
+                    "total_steps": 2,
+                    "tool_calls_log": stage_log,
+                }
+            ],
+        )
+        out = tmp_path / "cli-report.json"
+        monkeypatch.setattr(run_eval, "_known_tool_names", lambda: {"get_realtime_quote"})
+        monkeypatch.setattr(run_eval, "_build_executor", lambda: _result_executor(failed_result))
+
+        assert run_eval.main(
+            ["--sample", "failed_multi", "--golden-path", str(golden_path), "--json-out", str(out)]
+        ) == 1
+
+        report = json.loads(out.read_text(encoding="utf-8"))
+        assert report["run_status"] == "failed"
+        assert report["stage_metrics"]["missing_expected_stages"] == ["decision"]
+        assert "状态=failed" in capsys.readouterr().out
 
     def test_run_failure_exit_one(self, monkeypatch, capsys):
         class _Exploding:
