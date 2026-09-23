@@ -56,7 +56,7 @@ python evals/agent_trajectory/run_eval.py --all --json-out eval_report.json
 | `tool_calls_log` | 该阶段的原始工具调用日志;空日志也会保留阶段 |
 | `failure_reason` | `stage_failure` / `timeout` / `budget_skip` 等降级原因 |
 
-评估层按快照列表顺序把局部步数累加为 `cumulative_steps`,因此不同阶段从 1 重新计步不会碰撞。报告同时包含期望阶段命中率、缺失/额外阶段、完成/失败/跳过计数,以及每个阶段的状态、失败原因、局部/累计步数和工具调用/失败/重试指标。阶段 `tool_metrics` 仅统计该阶段日志中的调用数、工具名、冗余、缓存、失败和重试,不含期望工具命中率、缺失工具、期望外工具违规或 max-steps 违规。Golden 的 `expected_tools`、`allow_optional_tools`、`allowed_max_steps` 属于整条样例,只对汇总工具轨迹评估一次；当前不支持按阶段定义工具合规期望。关键阶段失败后,仍使用已返回的快照生成阶段报告;配置了 `expected_stages` 时,尚未执行的后续阶段会列入缺失阶段。specialist 并发执行后的快照由 scheduler 恢复为选中顺序,不依赖完成先后。
+评估层按快照列表顺序把局部步数累加为 `cumulative_steps`,因此不同阶段从 1 重新计步不会碰撞。该累计值也作为整条 Multi-Agent 轨迹的 agent-loop 步数传给顶层指标；`AgentResult.total_steps` 在 orchestrator 中保留原有阶段数语义,不用于轨迹 loop 预算评分。报告同时包含期望阶段命中率、缺失/额外阶段、完成/失败/跳过计数,以及每个阶段的状态、失败原因、局部/累计步数和工具调用/失败/重试指标。阶段 `tool_metrics` 仅统计该阶段日志中的调用数、工具名、冗余、缓存、失败和重试,不含期望工具命中率、缺失工具、期望外工具违规或 max-steps 违规。Golden 的 `expected_tools`、`allow_optional_tools`、`allowed_max_steps` 属于整条样例,只对汇总工具轨迹评估一次；当前不支持按阶段定义工具合规期望。关键阶段失败后,仍使用已返回的快照生成阶段报告;配置了 `expected_stages` 时,尚未执行的后续阶段会列入缺失阶段。specialist 并发执行后的快照由 scheduler 恢复为选中顺序,不依赖完成先后。
 
 golden 样例可选增加 `expected_stages` 字段:
 

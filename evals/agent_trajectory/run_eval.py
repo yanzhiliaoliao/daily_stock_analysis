@@ -136,10 +136,17 @@ def _evaluate_sample(executor, sample: GoldenSample):
         raise RuntimeError(f"agent run failed (success=false): {error or 'no error detail'}")
 
     log = getattr(result, "tool_calls_log", None) or []
-    total_steps = getattr(result, "total_steps", None)
-    metrics = compute_trajectory_metrics(log, sample, total_steps=total_steps)
+    stage_metrics = None
     if trajectories:
         stage_metrics = compute_stage_trajectory_metrics(trajectories, sample)
+        # The orchestrator's public total_steps retains its historical meaning
+        # (number of stages).  For trajectory scoring, the snapshots carry the
+        # authoritative per-stage loop counts and must be summed once.
+        total_steps = stage_metrics.cumulative_steps
+    else:
+        total_steps = getattr(result, "total_steps", None)
+    metrics = compute_trajectory_metrics(log, sample, total_steps=total_steps)
+    if trajectories:
         report = _build_multi_report(sample, metrics, stage_metrics)
         if run_failed:
             report["run_status"] = "failed"

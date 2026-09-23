@@ -291,6 +291,64 @@ class TestRunFailure:
         assert "阶段 technical: 状态=failed" in output
         assert "失败原因=timeout" in output
 
+    def test_orchestrator_stage_loop_totals_drive_global_budget_metrics(self, tmp_path, capsys):
+        try:
+            import litellm  # noqa: F401
+        except ModuleNotFoundError:
+            sys.modules["litellm"] = MagicMock()
+
+        from src.agent.orchestrator import AgentOrchestrator
+        from src.agent.protocols import StageResult, StageStatus
+
+        quote_log = [{"step": 1, "tool": "quote", "success": True}]
+        news_log = [{"step": 1, "tool": "news", "success": True}]
+        technical = MagicMock(agent_name="technical")
+        technical.run.return_value = StageResult(
+            stage_name="technical",
+            status=StageStatus.COMPLETED,
+            total_steps=3,
+            meta={"tool_calls_log": quote_log},
+        )
+        intel = MagicMock(agent_name="intel")
+        intel.run.return_value = StageResult(
+            stage_name="intel",
+            status=StageStatus.COMPLETED,
+            total_steps=3,
+            meta={"tool_calls_log": news_log},
+        )
+        orchestrator = AgentOrchestrator(tool_registry=MagicMock(), llm_adapter=MagicMock())
+        with (
+            patch.object(orchestrator, "_build_agent_chain", return_value=[technical, intel]),
+            patch.object(
+                orchestrator,
+                "_resolve_final_output",
+                return_value=({"ok": True}, "final report"),
+            ),
+        ):
+            result = orchestrator.run("analyze one stock")
+
+        # Keep the runtime's established stage-count contract; the evaluator
+        # must derive loop totals from the explicit stage snapshots instead.
+        assert result.total_steps == 2
+        assert [item["total_steps"] for item in result.stage_trajectories] == [3, 3]
+        sample = GoldenSample(
+            id="multi_aggregate_steps",
+            task_description="analyze one stock",
+            expected_tools=["quote", "news"],
+            allowed_max_steps=5,
+            expected_stages=["technical", "intel"],
+        )
+        report_path = tmp_path / "aggregate-steps.json"
+
+        run_eval.run_sample(_result_executor(result), sample, json_out=report_path)
+
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        assert report["stage_metrics"]["cumulative_steps"] == 6
+        assert report["metrics"]["distinct_steps"] == 6
+        assert report["metrics"]["max_steps_touched"] is True
+        assert report["violations"] == ["trajectory reached allowed_max_steps (5)"]
+        assert "消耗步数: 6 (触碰 max_steps: 是)" in capsys.readouterr().out
+
 
 # ---------------------------------------------------------------------------
 # 4. runtime-seam guards: multi-arch rejection + golden registry validation
